@@ -1,15 +1,21 @@
 import os
-import json
-import requests
+import math
 import streamlit as st
 
+from gamma_engine import (
+    GammaConfig,
+    fetch_option_chain,
+    normalize_chain,
+    summarize_gamma
+)
+
 st.set_page_config(
-    page_title="Mubarak Gamma Diagnostic",
+    page_title="Mubarak Gamma V1",
     layout="wide"
 )
 
-st.title("Mubarak Gamma — API Diagnostic")
-st.caption("اختبار اتصال MarketData.app قبل تشغيل محرك Gamma.")
+st.title("Mubarak Gamma V1 — Daily / Monthly Options")
+st.caption("Gamma dashboard for monthly/swing option decisions.")
 
 token = st.sidebar.text_input(
     "MarketData API Token",
@@ -22,133 +28,173 @@ symbol = st.sidebar.text_input(
     value="SPY"
 ).strip().upper()
 
+min_dte = st.sidebar.number_input(
+    "Minimum DTE",
+    min_value=1,
+    max_value=365,
+    value=20
+)
+
+max_dte = st.sidebar.number_input(
+    "Maximum DTE",
+    min_value=1,
+    max_value=365,
+    value=60
+)
+
+strike_pct = st.sidebar.slider(
+    "Strike range around spot",
+    min_value=5,
+    max_value=40,
+    value=15
+)
+
 run = st.sidebar.button(
-    "Test MarketData API",
+    "Refresh Gamma",
     type="primary"
 )
 
-def call_api(url, token):
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
 
-    response = requests.get(
-        url,
-        headers=headers,
-        timeout=30
-    )
+def money(x):
+    if x is None:
+        return "N/A"
 
-    return response
+    try:
+        if math.isnan(x):
+            return "N/A"
+    except Exception:
+        pass
+
+    a = abs(x)
+    sign = "-" if x < 0 else ""
+
+    if a >= 1e9:
+        return f"{sign}${a/1e9:.2f}B"
+
+    if a >= 1e6:
+        return f"{sign}${a/1e6:.2f}M"
+
+    if a >= 1e3:
+        return f"{sign}${a/1e3:.1f}K"
+
+    return f"{sign}${a:.0f}"
+
 
 if run:
 
     if not token:
-        st.error("Please enter your MarketData API Token.")
+        st.error("Enter your MarketData API token.")
         st.stop()
 
-    st.subheader("Step 1 — Option Expirations")
-
-    exp_url = (
-        f"https://api.marketdata.app/v1/options/expirations/"
-        f"{symbol}/"
+    cfg = GammaConfig(
+        min_dte=int(min_dte),
+        max_dte=int(max_dte),
+        strike_pct=float(strike_pct) / 100.0
     )
 
     try:
-        exp_response = call_api(exp_url, token)
-
-        st.write(
-            "HTTP Status:",
-            exp_response.status_code
-        )
-
-        try:
-            exp_data = exp_response.json()
-            st.json(exp_data)
-        except Exception:
-            st.code(exp_response.text)
-
-    except Exception as e:
-        st.error(
-            f"Expiration request failed: {e}"
-        )
-        st.stop()
-
-    st.divider()
-
-    st.subheader("Step 2 — Option Chain")
-
-    chain_url = (
-        f"https://api.marketdata.app/v1/options/chain/"
-        f"{symbol}/"
-    )
-
-    try:
-        chain_response = call_api(
-            chain_url,
+        raw = fetch_option_chain(
+            symbol,
             token
         )
 
-        st.write(
-            "HTTP Status:",
-            chain_response.status_code
+        chain, spot = normalize_chain(
+            raw,
+            cfg
         )
 
-        try:
-            chain_data = chain_response.json()
-
-            if isinstance(chain_data, dict):
-
-                status = chain_data.get(
-                    "s",
-                    "unknown"
-                )
-
-                st.write(
-                    "API Status:",
-                    status
-                )
-
-                if "errmsg" in chain_data:
-                    st.error(
-                        chain_data["errmsg"]
-                    )
-
-                symbols = chain_data.get(
-                    "symbol",
-                    []
-                )
-
-                if isinstance(symbols, list):
-                    st.metric(
-                        "Option contracts returned",
-                        len(symbols)
-                    )
-
-                st.json(chain_data)
-
-            else:
-                st.json(chain_data)
-
-        except Exception:
-            st.code(
-                chain_response.text
-            )
+        s = summarize_gamma(
+            chain,
+            spot
+        )
 
     except Exception as e:
-        st.error(
-            f"Option chain request failed: {e}"
+        st.error(str(e))
+        st.stop()
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    c1.metric(
+        "Spot",
+        f"${s['spot']:.2f}"
+    )
+
+    c2.metric(
+        "Net GEX",
+        money(s["net_gex"])
+    )
+
+    c3.metric(
+        "Call Wall",
+        f"${s['call_wall']:.2f}"
+    )
+
+    c4.metric(
+        "Put Wall",
+        f"${s['put_wall']:.2f}"
+    )
+
+    if math.isnan(s["gamma_flip"]):
+        flip_text = "N/A"
+    else:
+        flip_text = f"${s['gamma_flip']:.2f}"
+
+    c5.metric(
+        "Gamma Flip",
+        flip_text
+    )
+
+    st.subheader(
+        f"Regime: {s['regime']}"
+    )
+
+    if s["regime"] == "POSITIVE GAMMA":
+        st.success(
+            "Positive Gamma regime: price action may be more stable and mean-reverting around major gamma levels."
+        )
+    else:
+        st.warning(
+            "Negative Gamma regime: price action may be more volatile and directional."
         )
 
-    st.divider()
+    st.subheader("Gamma by Strike")
 
-    st.info(
-        "Do not send your API Token. "
-        "Send only a screenshot of the diagnostic results."
+    chart_df = (
+        s["by_strike"]
+        .set_index("strike")
+        [["net_gex"]]
+    )
+
+    st.bar_chart(chart_df)
+
+    st.subheader("Strike Table")
+
+    st.dataframe(
+        s["by_strike"],
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.subheader("Contracts Used")
+
+    st.dataframe(
+        chain[
+            [
+                "optionSymbol",
+                "expiration_dt",
+                "side",
+                "strike",
+                "openInterest",
+                "gamma",
+                "gex"
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True
     )
 
 else:
 
     st.info(
-        "Enter your token, keep SPY as the symbol, "
-        "then press Test MarketData API."
+        "Enter your API token, choose a symbol, then press Refresh Gamma."
     )
