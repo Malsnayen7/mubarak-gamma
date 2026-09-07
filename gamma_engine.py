@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import math
 import requests
 import pandas as pd
@@ -25,10 +25,24 @@ def fetch_option_chain(symbol, token):
     if not symbol:
         raise RuntimeError("Symbol is empty.")
 
+    today = datetime.now(timezone.utc).date()
+    cfg = GammaConfig()
+    from_date = today + timedelta(days=cfg.min_dte)
+    to_date = today + timedelta(days=cfg.max_dte)
+
     url = f"{API_ROOT}/options/chain/{symbol}/"
     headers = {"Authorization": f"Bearer {token}"}
+    params = {
+        "from": from_date.isoformat(),
+        "to": to_date.isoformat(),
+    }
 
-    response = requests.get(url, headers=headers, timeout=30)
+    response = requests.get(
+        url,
+        headers=headers,
+        params=params,
+        timeout=60,
+    )
 
     if response.status_code not in (200, 203):
         try:
